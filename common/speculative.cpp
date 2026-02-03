@@ -1879,6 +1879,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+        // hash indices of ngrams consulted during the most recent draft
+        std::vector<size_t> used_hashes;
     };
 
     std::vector<seq_info> sinfos;
@@ -1943,6 +1945,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const auto & prompt = *dparams.prompt;
 
         sinfo.n_draft_last = 0;
+        sinfo.used_hashes.clear();
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
@@ -1978,6 +1981,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 break;
             }
             result[n + i] = token;
+            // remember which hash entry produced this token
+            sinfo.used_hashes.push_back(mod.index(result.data() + i));
         }
 
         // only return the m tokens that were drafted
@@ -2018,21 +2023,36 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
-            if (f_acc < 0.25) {
-                sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
-                    }
 
-                    mod.reset();
+            // update per-ngram scores based on acceptance outcome
+            for (size_t i = 0; i < sinfo.n_draft_last; ++i) {
+                if (i < static_cast<size_t>(n_accepted)) {
+                    mod.inc_score_by_index(sinfo.used_hashes[i]);
+                } else {
+                    mod.dec_score_by_index(sinfo.used_hashes[i]);
+                }
+            }
+
+            if (f_acc < 0.5) {
+                sinfo.n_low++;
+                if (sinfo.n_low >= 3) {
+                    SPC_TRC("low acceptance streak (%d) - pruning ngram_mod\n", sinfo.n_low);
+                    // Log detailed score metrics before pruning
+                    mod.update_score_stats();
+                    SPC_TRC("before prune scores - below_thr=%zu, at_min=%zu, at_max=%zu, at_ins=%zu\n",
+                            mod.get_below_thr(),
+                            mod.get_at_min(),
+                            mod.get_at_max(),
+                            mod.get_at_ins());
+
+                    mod.prune_low_score();
                     sinfo.n_low = 0;
-                    sinfo.i_last = 0;
                 }
             } else {
                 sinfo.n_low = 0;
             }
         }
+        sinfo.used_hashes.clear();
     }
 };
 
