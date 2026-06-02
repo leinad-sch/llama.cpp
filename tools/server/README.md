@@ -1080,6 +1080,9 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+| `llamacpp:kv_cache_used_cells` | Gauge | Number of KV cache cells currently in use. |
+| `llamacpp:kv_cache_total_cells` | Gauge | Total number of KV cache cells. |
+| `llamacpp:kv_cache_usage_ratio` | Gauge | Ratio of KV cache cells currently in use. |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 

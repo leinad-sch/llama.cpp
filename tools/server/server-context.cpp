@@ -2568,6 +2568,10 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    const llama_memory_kv_cache_stats kv_cache_stats = llama_memory_get_kv_cache_stats(llama_get_memory(ctx_tgt));
+                    res->kv_cache_used_cells  = kv_cache_stats.used_cells;
+                    res->kv_cache_total_cells = kv_cache_stats.total_cells;
+
                     res->n_draft_tokens_total      = metrics.n_draft_tokens_total;
                     res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
                     res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
@@ -4494,6 +4498,18 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "kv_cache_used_cells"},
+                    {"help",  "Number of KV cache cells currently in use."},
+                    {"value",  res_task->kv_cache_used_cells}
+            },{
+                    {"name",  "kv_cache_total_cells"},
+                    {"help",  "Total number of KV cache cells."},
+                    {"value",  res_task->kv_cache_total_cells}
+            },{
+                    {"name",  "kv_cache_usage_ratio"},
+                    {"help",  "Ratio of KV cache cells currently in use."},
+                    {"value",  res_task->kv_cache_total_cells ? (double) res_task->kv_cache_used_cells / res_task->kv_cache_total_cells : 0.}
             }}}
         };
 
