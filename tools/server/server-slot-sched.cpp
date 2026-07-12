@@ -10,7 +10,7 @@
 // server_prompt
 //
 
-server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const {
+server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min, uint32_t n_rs_seq, bool ckpt_exact) const {
     server_prompt_reuse res;
     res.n_past   = n_prefix;
     res.pos_next = tokens.pos_next(n_prefix);
@@ -22,7 +22,10 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
     // a state or a checkpoint is useful when its pos_min is below this threshold
     const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
 
-    if (pos_min < pos_min_thold) {
+    // with enough per-token snapshots, the recurrent state can be rolled back to pos_next directly
+    const bool can_rollback = n_rs_seq > 0 && pos_min < pos_min_thold + (llama_pos) n_rs_seq;
+
+    if (pos_min < pos_min_thold || can_rollback) {
         return res;
     }
 
@@ -34,6 +37,11 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
             const auto & cur = *ckpt;
             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
             SRV_TRC("checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+            if (ckpt_exact) {
+                // usable only if the tokens up to and including its position are
+                // a prefix of the new prompt
+                return cur.pos_max < pos_min_thold;
+            }
             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
             if (cur.pos_max > res.pos_next) {
                 return false;
