@@ -39,7 +39,7 @@ if (CUDAToolkit_FOUND)
 
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
                 # The CUDA architecture 120f-virtual would in principle work for Blackwell support
-                #     but the newly added "f" suffix conflicted with a preexising regex for validating CUDA architectures in CMake.
+                #     but the newly added "f" suffix conflicted with a preexisting regex for validating CUDA architectures in CMake.
                 # So either a recent CMake version or one with the backported fix is needed.
                 # The following versions should work:
                 #   - CMake >= v3.31.8 && CMake < v4.0.0
