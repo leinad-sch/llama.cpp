@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <cstddef>
 
@@ -38,6 +39,11 @@ struct common_ngram_mod {
     void inc_score_by_index(size_t i);
     void dec_score_by_index(size_t i);
     void prune_low_score(); // remove entries below SCORE_THR
+
+    // save/load the hash table to/from a file (atomic write on save)
+    // returns true on success, false on error (load silently starts empty on failure)
+    bool save(const std::string & path) const;
+    bool load(const std::string & path);
 
     size_t get_n()    const;
     size_t get_used() const;

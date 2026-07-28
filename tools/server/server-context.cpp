@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <optional>
 #include <exception>
 #include <memory>
 #include <filesystem>
