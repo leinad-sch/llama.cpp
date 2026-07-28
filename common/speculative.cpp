@@ -1375,6 +1375,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // ctx_dft state is stale, so produce at most 1 draft token to avoid verifying garbage
     bool cold_start = false;
 
+    size_t n_cold_start = 0;          // times MTP exited skip mode
+    size_t n_cold_start_tokens = 0;   // total tokens generated in cold_start rounds
+    size_t n_cold_start_rejected = 0; // cold_start tokens rejected at verification
+    std::vector<bool> cold_start_seq; // per-seq cold_start tracking for accept()
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1405,6 +1410,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
+        cold_start_seq.assign(n_seq, false);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
@@ -1631,6 +1637,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             if (skip_process) {
                 cold_start = true;
+                n_cold_start++;
+                std::fill(cold_start_seq.begin(), cold_start_seq.end(), false);
+                for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
+                    if (dparams[sid].drafting) {
+                        cold_start_seq[sid] = true;
+                    }
+                }
+                LOG_INF("%s: MTP cold_start, seqs needing draft: %d\n", __func__, n_need_draft);
             }
             skip_process = false;
         }
@@ -1725,6 +1739,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // cold_start: on the first draft after a skip period ctx_dft is stale,
                 // so stop after the first token to avoid verifying a long garbage sequence
                 if (cur_p->data[0].p < params.p_min || cold_start) {
+                    if (cold_start) {
+                        n_cold_start_tokens++;
+                    }
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1790,13 +1807,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                cold_start_seq[seq_id] = false;
             }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (!is_other && cold_start_seq[seq_id]) {
+            if (n_accepted == 0) {
+                n_cold_start_rejected++;
+            }
+            cold_start_seq[seq_id] = false;
         }
 
         // don't update pending_h with stale verify_h data when process() was skipped
@@ -2109,7 +2134,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // compute adaptive draft length based on number of accepted tokens from last draft
         const int n_prev = sinfo.n_accepted_last;
         const int n_draft_target = (n_prev > 0)
-            ? std::max(params.n_min, std::min((int)std::ceil(n_prev * 1.67), params.n_max))
+            ? std::max(params.n_min, std::min((int)std::ceil(n_prev * 1.5), params.n_max))
             : params.n_min;
         const int n_max_eff = n_draft_target;
         const int n_min_eff = params.n_min;
@@ -3263,9 +3288,10 @@ void common_speculative_draft(common_speculative * spec) {
             }
         }
 
-        if (n_drafting == 0) {
-            break;
-        }
+        // NOTE: the early-exit break for n_drafting == 0 was intentionally removed.
+        // MTP (lowest priority) must be called every round so it can track skip_process
+        // and set cold_start when its ctx_dft went stale from being skipped.
+        // Without this, skip_process is never set to true and cold_start never fires.
     }
 
     // these sequences failed to generate a draft
@@ -3390,7 +3416,17 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        std::string str_cs;
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            const auto * mtp = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+            std::ostringstream oss;
+            oss << ", #cold_start = " << mtp->n_cold_start
+                << ", #cs_tokens = " << mtp->n_cold_start_tokens
+                << ", #cs_rejected = " << mtp->n_cold_start_rejected;
+            str_cs = oss.str();
+        }
+
+        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
@@ -3398,6 +3434,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_stats.c_str(),
-                str_perf.c_str());
+                str_perf.c_str(),
+                str_cs.c_str());
     }
 }
