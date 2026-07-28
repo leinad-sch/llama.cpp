@@ -1365,6 +1365,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // when true, process() will be skipped and ctx_dft won't be kept in sync with ctx_tgt
+    // set when all sequences had their drafts satisfied by a higher-priority impl in the previous round
+    bool skip_process = false;
+
+    // when true, the next draft() call is the first one after a skip→active transition
+    // ctx_dft state is stale, so produce at most 1 draft token to avoid verifying garbage
+    bool cold_start = false;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1466,6 +1474,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        skip_process = false;
+        cold_start = false;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1604,6 +1615,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        // check if all sequences already have drafts from a higher-priority impl
+        {
+            int n_need_draft = 0;
+            for (auto & dp : dparams) {
+                if (dp.drafting) {
+                    n_need_draft++;
+                }
+            }
+            if (n_need_draft == 0) {
+                skip_process = true;
+                return;
+            }
+            if (skip_process) {
+                cold_start = true;
+            }
+            skip_process = false;
+        }
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -1691,7 +1720,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // cold_start: on the first draft after a skip period ctx_dft is stale,
+                // so stop after the first token to avoid verifying a long garbage sequence
+                if (cur_p->data[0].p < params.p_min || cold_start) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1732,12 +1763,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
 
+            // evaluate the drafted tokens on the draft model
+            ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
+                break;
+            }
+
             ++i;
         }
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+
         }
+
+        cold_start = false;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1753,6 +1794,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        // don't update pending_h with stale verify_h data when process() was skipped
+        if (skip_process) {
             return;
         }
 
@@ -2884,6 +2930,9 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        if (!impl->need_process()) {
+            continue;
+        }
         result = result && impl->process(batch);
     }
 
