@@ -3853,6 +3853,35 @@ private:
             }
         }
 
+        int32_t i_next = 0;
+
+        // detect speculative verification slots
+        std::vector<llama_seq_id> spec_slots;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
+                spec_slots.push_back(slot.id);
+            }
+        }
+        int64_t t_verify_acc = 0;
+
+        // process the created batch of tokens
+        for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
+            const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+
+            llama_batch batch_view = {
+                n_tokens,
+                batch.token    + i,
+                nullptr,
+                batch.pos      + i,
+                batch.n_seq_id + i,
+                batch.seq_id   + i,
+                batch.logits   + i,
+            };
+
+            const int64_t t_v_start = !spec_slots.empty() ? ggml_time_us() : -1;
+
+        const int ret = llama_decode(ctx_tgt, batch_view);
+
         bool has_output = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
@@ -3934,6 +3963,23 @@ private:
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
+                break;
+            }
+
+            if (t_v_start > 0) {
+                t_verify_acc += ggml_time_us() - t_v_start;
+            }
+
+            if (t_v_start > 0) {
+                t_verify_acc += ggml_time_us() - t_v_start;
+            }
+
+            // move the head of the batch forward with the number of tokens we just processed
+            i_next = i + n_tokens;
+
+            // on successful decode, restore the original batch size
+            n_batch = llama_n_batch(ctx_tgt);
+            // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
@@ -4242,8 +4288,29 @@ private:
 
             slot.print_timings_tg();
 
-            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-        });
+                SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+            }
+        }
+
+        if (t_verify_acc > 0) {
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, t_verify_acc);
+            }
+        }
+
+        if (t_verify_acc > 0) {
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, t_verify_acc);
+            }
+        }
+
+        if (t_verify_acc > 0) {
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, t_verify_acc);
+            }
+        }
+
+        SRV_DBG("%s", "run slots completed\n");
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

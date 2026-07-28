@@ -159,6 +159,7 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_verify_us = 0; // total time spent in draft verification by the target model in microseconds.
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -3035,6 +3036,14 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 }
 
+void common_speculative_add_verify_time(common_speculative * spec, llama_seq_id seq_id, int64_t dt_us) {
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    GGML_ASSERT(impl);
+
+    impl->t_verify_us += dt_us;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3046,8 +3055,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
-            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
-            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_verify_us / 1000.0;
+            str_perf = ", dur(b,g,a,v) = " + oss.str() + " ms";
         } else {
             str_perf = "";
         }
