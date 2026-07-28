@@ -1679,14 +1679,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         int i = 0;
+        int ret = 0;
 
         while (n_drafting > 0) {
-            // each step decodes under a different head, i.e. a different decoder layer, and
-            // KV is per layer. process() filled this layer's KV only for positions < pos0
-            // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
-            // draft region (the seq_rm lower bound is pos0, leaving the prompt KV intact)
-            // and select head i so it rebuilds its own layer's KV there; decoding just the
-            // latest token would leave its attention reading cells only another head wrote.
+            // for chain_heads: each step decodes under a different head, so KV is reset
+            // via seq_rm and the full prefix must be re-decoded at the new head's layer
             if (chain_heads) {
                 auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1697,10 +1694,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_decode(ctx_dft, batch);
-            if (ret != 0) {
-                SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
-                break;
+            // non-chain_heads: only the seed decode (i == 0) is needed.
+            // Subsequent iterations would re-decode positions already handled by the
+            // bottom decode of the previous iteration, violating M-RoPE's strict X < Y.
+            if (chain_heads || i == 0) {
+                ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                    break;
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
