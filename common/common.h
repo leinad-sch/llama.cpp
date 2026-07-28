@@ -371,6 +371,10 @@ struct common_params_speculative_ngram_mod {
     int32_t n_min = 48;
 
     ngram_mod_cache_mode cache_mode = ngram_mod_cache_mode::SHARED;
+
+    std::string cache_file; // path to persist the hash table across sessions (empty = no persistence)
+
+    bool use_v2 = false;   // use keyed hash table (eliminates false positives at the cost of more memory)
 };
 
 struct common_params_speculative_ngram_map {

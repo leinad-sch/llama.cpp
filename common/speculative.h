@@ -3,6 +3,10 @@
 #include "llama.h"
 #include "common.h"
 
+#include <optional>
+#include <string>
+#include <vector>
+
 struct common_speculative;
 
 // comma separated list the provided types
