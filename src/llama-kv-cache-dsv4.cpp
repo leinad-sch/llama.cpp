@@ -1244,6 +1244,18 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     return false;
 }
 
+llama_memory_kv_cache_stats llama_kv_cache_dsv4::get_kv_cache_stats() const {
+    auto stats_raw = kv_raw->get_kv_cache_stats();
+    auto stats_csa = kv_csa->get_kv_cache_stats();
+    auto stats_hca = kv_hca->get_kv_cache_stats();
+    auto stats_lid = kv_lid->get_kv_cache_stats();
+
+    stats_raw.used_cells  += stats_csa.used_cells + stats_hca.used_cells + stats_lid.used_cells;
+    stats_raw.total_cells += stats_csa.total_cells + stats_hca.total_cells + stats_lid.total_cells;
+
+    return stats_raw;
+}
+
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
