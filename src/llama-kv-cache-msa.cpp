@@ -157,6 +157,16 @@ bool llama_kv_cache_msa::get_can_shift() const {
            kv_base->get_size() == kv_idx->get_size();
 }
 
+llama_memory_kv_cache_stats llama_kv_cache_msa::get_kv_cache_stats() const {
+    llama_memory_kv_cache_stats stats_base = kv_base->get_kv_cache_stats();
+    llama_memory_kv_cache_stats stats_idx  = kv_idx ->get_kv_cache_stats();
+
+    stats_base.used_cells  += stats_idx.used_cells;
+    stats_base.total_cells += stats_idx.total_cells;
+
+    return stats_base;
+}
+
 void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_base->state_write(io, seq_id, flags);
     kv_idx ->state_write(io, seq_id, flags);
