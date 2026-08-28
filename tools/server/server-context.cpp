@@ -299,9 +299,22 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache) {
         if (prompt.tokens.size() == 0) {
             return false;
+        }
+
+        // bring the draft context (ctx_dft) in sync with the target before serializing it
+        // into the slot cache, so the saved pair (ctx_tgt, ctx_dft) is consistent. otherwise a
+        // backlog accumulated while a higher-priority draft impl (ngram-mod) was skipping MTP
+        // would be written stale and restored stale on the next turn.
+        if (spec) {
+            common_speculative_flush(spec, id);
+            // if flush failed (e.g. decode error) ctx_dft is still stale - don't save inconsistent pair
+            if (ctx_dft && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) !=
+                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id)) {
+                return false;
+            }
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2404,6 +2417,16 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // sync the draft context before saving it into the checkpoint, otherwise the
+        // backlog accumulated while MTP was skipped would be persisted stale.
+        if (spec) {
+            common_speculative_flush(spec.get(), slot.id);
+            if (ctx_dft && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) !=
+                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)) {
+                // flush failed - skip checkpoint to avoid persisting stale ctx_dft
+                return;
+            }
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3316,6 +3339,16 @@ private:
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+
+                        // reset the speculative sampler (incl. MTP skip/catch-up state) BEFORE the
+                        // prompt is prefilled. doing this only at generation start would leave a stale
+                        // skip_process from the previous task, causing the prefill to stash embeddings
+                        // instead of syncing ctx_dft (draft KV then lags the target by the prefill size).
+                        // reset() is the lightweight counterpart of begin(): it clears the backlog
+                        // without emitting the (post-prefill) sync warning.
+                        if (spec) {
+                            common_speculative_reset(spec.get(), slot.id);
+                        }
 
                         // print prompt tokens (for debugging)
                         /*if (1) {

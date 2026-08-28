@@ -1367,18 +1367,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // when true, process() will be skipped and ctx_dft won't be kept in sync with ctx_tgt
-    // set when all sequences had their drafts satisfied by a higher-priority impl in the previous round
+    // when true, process() will be skipped (no decode of ctx_dft) and the consumed tokens
+    // are only stashed into the catch-up backlog instead. set when all sequences had their
+    // drafts satisfied by a higher-priority impl (e.g. ngram-mod) in the previous round.
     bool skip_process = false;
 
-    // when true, the next draft() call is the first one after a skip→active transition
-    // ctx_dft state is stale, so produce at most 1 draft token to avoid verifying garbage
-    bool cold_start = false;
+    // one entry per token consumed while skip_process was true: the token id, its target
+    // position, and the target's nextn embedding (shifted by one when replayed into ctx_dft).
+    // drained in a single llama_decode pass by sync_ctx_dft() to resync ctx_dft with ctx_tgt.
+    struct catchup_entry {
+        llama_token        id;
+        llama_pos          pos;
+        std::vector<float> emb; // [n_embd]
+    };
+    std::vector<std::vector<catchup_entry>> catchup; // [n_seq]
 
-    size_t n_cold_start = 0;          // times MTP exited skip mode
-    size_t n_cold_start_tokens = 0;   // total tokens generated in cold_start rounds
-    size_t n_cold_start_rejected = 0; // cold_start tokens rejected at verification
-    std::vector<bool> cold_start_seq; // per-seq cold_start tracking for accept()
+    size_t n_catchup         = 0; // times the backlog was drained
+    size_t n_catchup_tokens  = 0; // total tokens replayed while draining
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1410,7 +1415,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
-        cold_start_seq.assign(n_seq, false);
+        catchup.assign(n_seq, {});
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
@@ -1482,24 +1487,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // reset the skip/catch-up state for the new prompt (also done at prompt start via
+        // reset(), kept here for idempotency).
         skip_process = false;
-        cold_start = false;
+        catchup[seq_id].clear();
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
         }
 
-        auto * ctx_dft = this->params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-
-        if (pos_max < N - 1 && !is_mem_shared) {
-            SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
-                    "process() hook may not have run on every prefill ubatch "
-                    "(need_embd / logits=1 on every prompt position?). "
-                    "Drafts may degrade.\n",
-                    (int) pos_max, N - 1);
+        if (is_mem_shared) {
+            return;
         }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * ctx_tgt = this->params.ctx_tgt;
+        const llama_pos pos_max_dft  = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        const llama_pos pos_max_tgt  = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id);
+
+        // at generation start (after the full prefill) the target head equals N-1, so a gap here
+        // means ctx_dft was not synced for the prefilled prompt tokens - drafts may degrade for
+        // those positions. at prompt start (before prefill) both heads are the restored checkpoint
+        // and match, so this stays silent and does not false-alarm.
+        if (pos_max_dft < pos_max_tgt) {
+            SPC_WRN("ctx_dft pos_max=%d < ctx_tgt pos_max=%d - draft KV is %d behind the target. "
+                    "the prefill was not replayed into ctx_dft (stale skip_process?). "
+                    "Drafts may degrade for those positions.\n",
+                    (int) pos_max_dft, (int) pos_max_tgt, (int) (pos_max_tgt - pos_max_dft));
+        }
+    }
+
+    void reset(llama_seq_id seq_id) override {
+        // clear the skip/catch-up backlog and re-enable ctx_dft syncing for the new prompt.
+        // must run before the prompt is prefilled; otherwise a stale skip_process (left true at
+        // the end of the previous task's generation, when a higher-priority drafter like ngram-mod
+        // was active) makes the prefill stash embeddings into catchup instead of syncing ctx_dft.
+        skip_process = false;
+        catchup[seq_id].clear();
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1535,6 +1560,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // While skipped, do not decode ctx_dft. Instead stash the target's nextn embeddings
+        // for every consumed token so ctx_dft can be resynced later in a single pass
+        // (see sync_ctx_dft). This avoids both the redundant per-round decode and the
+        // "cold start" that previously limited the first post-skip draft to 1 token.
+        if (skip_process) {
+            if (!is_mem_shared) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    auto & cu = catchup[seq_id];
+                    for (int k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                        const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k);
+                        const llama_pos   pos = batch_in.pos[k];
+                        const llama_token tok = batch_in.token[k];
+                        // the context-token re-feed re-stashes the previous round's last committed
+                        // token over a rejected draft tail at the same position (always the back
+                        // when it happens). replace in place to keep the committed embedding.
+                        if (!cu.empty() && cu.back().pos == pos) {
+                            cu.back().id  = tok;
+                            cu.back().emb.assign(h, h + n_embd);
+                        } else {
+                            bool found = false;
+                            for (auto & e : cu) {
+                                if (e.pos == pos) {
+                                    e.id  = tok;
+                                    e.emb.assign(h, h + n_embd);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                cu.push_back({ tok, pos, std::vector<float>(h, h + n_embd) });
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1620,6 +1686,142 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // resync ctx_dft with ctx_tgt for one sequence by replaying its catch-up backlog in
+    // a single (possibly chunked) llama_decode pass. the backlog holds, for each consumed
+    // token, its target position and the target's nextn embedding; these are fed to the MTP
+    // head with the standard one-position shift (row for pos p uses the nextn embedding of
+    // the token at p-1, and the very first row uses pending_h). no-op when memory is shared.
+    void sync_ctx_dft(llama_seq_id seq_id) {
+        if (is_mem_shared) {
+            catchup[seq_id].clear();
+            return;
+        }
+
+        auto & cu = catchup[seq_id];
+        const int32_t M = (int32_t) cu.size();
+        if (M == 0) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * ctx_tgt = this->params.ctx_tgt;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const int32_t n_b = llama_n_batch(ctx_dft); // capacity of the reusable batch
+
+        // A context shift (KV rebase) can happen while MTP is skipped, rebasing the target's
+        // positions downward. The backlog then mixes pre-shift (high) and post-shift (low)
+        // coordinates: replaying it would be non-monotonic and desync ctx_dft from the target.
+        // Keep only the trailing monotonic-increasing run (the post-shift tokens); the dropped
+        // prefix lived in the old coordinate space and was already removed from ctx_dft by the
+        // server's seq_rm, so it must not be replayed.
+        // trailing monotonic-increasing run start. for a fully increasing backlog (the normal
+        // no-context-shift case) no non-monotonic pair exists, so the run starts at index 0.
+        // (init to 0, NOT M: M would make the replay loop skip the whole backlog and no-op.)
+        int32_t s = 0;
+        for (int32_t i = M - 1; i > 0; --i) {
+            if (cu[i - 1].pos >= cu[i].pos) {
+                s = i;
+                break;
+            }
+        }
+
+        // Also skip entries already present in ctx_dft's KV, or past the target's head (ctx_dft
+        // must never advance beyond the target). This keeps the M-RoPE invariant X < Y and avoids
+        // over-decoding.
+        const int32_t dft_head = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        const int32_t tgt_head = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id);
+
+        // measure whether the backlog covers up to tgt_head. the backlog extending past
+        // tgt_head is not expected; only warn when tokens are actually missing.
+        if (M > 0 && (tgt_head - cu[M - 1].pos) > 0) {
+            SPC_DBG("SYNC entry: M=%d cu[0].pos=%d cu[M-1].pos=%d dft_head=%d tgt_head=%d "
+                    "tail_missing=%d s=%d\n",
+                    (int) M, (int) cu[0].pos, (int) cu[M - 1].pos,
+                    (int) dft_head, (int) tgt_head,
+                    (int) (tgt_head - cu[M - 1].pos), (int) s);
+        }
+
+        int32_t a = s;
+        while (a < M && (cu[a].pos <= dft_head || cu[a].pos > tgt_head)) {
+            a++;
+        }
+        if (a >= M) {
+            cu.clear();
+            return;
+        }
+
+        int32_t last = a;
+        while (last + 1 < M && cu[last + 1].pos <= tgt_head) {
+            last++;
+        }
+        if (last < a) {
+            cu.clear();
+            return;
+        }
+
+        n_catchup++;
+        n_catchup_tokens += (size_t) (last - a + 1);
+
+        // running seed for the first row of each chunk: the nextn embedding of the token just
+        // before the first replayed entry. the last sync/process left pending_h at dft_head, so
+        // it is the correct predecessor embedding for cu[a].pos.
+        const float * seed = pending_h[seq_id].data();
+
+        while (a <= last) {
+            const int32_t b = std::min(a + n_b, last + 1); // exclusive end of this chunk
+            const int32_t csize = b - a;
+            (void) csize;
+
+            common_batch_clear(batch);
+            for (int32_t k = a; k < b; ++k) {
+                common_batch_add(batch, cu[k].id, cu[k].pos, { seq_id }, false);
+            }
+
+            // shift-by-one embedding layout
+            std::memcpy(batch.embd + (size_t) 0 * n_embd, seed, row_bytes);
+            for (int32_t k = a + 1; k < b; ++k) {
+                std::memcpy(batch.embd + (size_t) k * n_embd, cu[k - 1].emb.data(), row_bytes);
+            }
+
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (int head = 0; head < n_mtp_layers; ++head) {
+                if (chain_heads) {
+                    llama_memory_seq_rm(mem_dft, seq_id, cu[a].pos, -1);
+                    llama_set_nextn_layer_offset(ctx_dft, head);
+                }
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                            head, (int) rc, (int) cu[a].pos);
+                    return;
+                }
+            }
+            if (chain_heads) {
+                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+            }
+
+            seed = cu[b - 1].emb.data();
+            a = b;
+        }
+
+        // the last consumed token's nextn embedding is carried forward for the next draft
+        std::memcpy(pending_h[seq_id].data(), cu[last].emb.data(), row_bytes);
+
+        cu.clear();
+
+        if (tgt_head >= 0) {
+            const int32_t fin_head = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+            if ((tgt_head - fin_head) != 0) {
+                SPC_DBG("SYNC exit: dft_head_after=%d tgt_head=%d still_missing=%d\n",
+                        (int) fin_head, (int) tgt_head, (int) (tgt_head - fin_head));
+            }
+        }
+    }
+
+    void flush(llama_seq_id seq_id) override {
+        sync_ctx_dft(seq_id);
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -1635,16 +1837,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 skip_process = true;
                 return;
             }
+            // skip -> active transition: a higher-priority impl stopped drafting, so resync
+            // ctx_dft in one pass before we draft. no cold start, full-depth drafts resume.
             if (skip_process) {
-                cold_start = true;
-                n_cold_start++;
-                std::fill(cold_start_seq.begin(), cold_start_seq.end(), false);
                 for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
                     if (dparams[sid].drafting) {
-                        cold_start_seq[sid] = true;
+                        sync_ctx_dft(sid);
                     }
                 }
-                LOG_INF("%s: MTP cold_start, seqs needing draft: %d\n", __func__, n_need_draft);
+                LOG_INF("%s: MTP resync after skip, seqs needing draft: %d\n", __func__, n_need_draft);
             }
             skip_process = false;
         }
@@ -1667,6 +1868,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+
+            // keep the seed position strictly past ctx_dft's KV head. a context shift or a
+            // rejected draft tail can leave n_past one position behind the synced ctx_dft head
+            // (e.g. right after a resync), and seeding at <= head would violate M-RoPE's X < Y.
+            // for the MTP shift this is still correct: id_last's hidden (pending_h) seeds the
+            // row at head+1, which predicts the token at head+1.
+            const int32_t dft_head = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+            if (dp.n_past <= dft_head) {
+                dp.n_past = dft_head + 1;
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1738,12 +1949,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 // only collect very high-confidence draft tokens
-                // cold_start: on the first draft after a skip period ctx_dft is stale,
-                // so stop after the first token to avoid verifying a long garbage sequence
-                if (cur_p->data[0].p < params.p_min || cold_start) {
-                    if (cold_start) {
-                        n_cold_start_tokens++;
-                    }
+                if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1799,8 +2005,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         }
 
-        cold_start = false;
-
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1809,24 +2013,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
-                cold_start_seq[seq_id] = false;
             }
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        (void) is_other;
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        if (!is_other && cold_start_seq[seq_id]) {
-            if (n_accepted == 0) {
-                n_cold_start_rejected++;
-            }
-            cold_start_seq[seq_id] = false;
-        }
-
         // don't update pending_h with stale verify_h data when process() was skipped
+        // (ctx_dft is being replayed from the catch-up backlog instead, which sets pending_h)
         if (skip_process) {
             return;
         }
@@ -3203,6 +3401,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id);
+    }
+}
+
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
@@ -3292,8 +3500,8 @@ void common_speculative_draft(common_speculative * spec) {
 
         // NOTE: the early-exit break for n_drafting == 0 was intentionally removed.
         // MTP (lowest priority) must be called every round so it can track skip_process
-        // and set cold_start when its ctx_dft went stale from being skipped.
-        // Without this, skip_process is never set to true and cold_start never fires.
+        // and drain its catch-up backlog (resync ctx_dft) when a higher-priority impl stops
+        // drafting. Without this, skip_process is never set to true and the backlog never drains.
     }
 
     // these sequences failed to generate a draft
@@ -3339,6 +3547,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->flush(seq_id);
     }
 }
 
@@ -3422,9 +3640,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
         if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
             const auto * mtp = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
             std::ostringstream oss;
-            oss << ", #cold_start = " << mtp->n_cold_start
-                << ", #cs_tokens = " << mtp->n_cold_start_tokens
-                << ", #cs_rejected = " << mtp->n_cold_start_rejected;
+            oss << ", #catchup = " << mtp->n_catchup
+                << ", #catchup_tokens = " << mtp->n_catchup_tokens;
             str_cs = oss.str();
         }
 

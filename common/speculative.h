@@ -80,6 +80,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// reset per-seq speculative state for a new prompt (e.g. MTP skip/catch-up backlog).
+// call at prompt start, BEFORE the prompt is prefilled, so a stale skip_process from the
+// previous task does not make the prefill stash instead of sync the draft KV.
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
@@ -88,6 +93,11 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// force every implementation to bring its KV cache in sync with the target up to the current
+// position (e.g. MTP draining its catch-up backlog). call this before serializing the draft
+// context into the slot / prompt cache so a consistent ctx_dft is written.
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
