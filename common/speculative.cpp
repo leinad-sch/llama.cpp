@@ -2490,7 +2490,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , mod(params.ngram_mod.n_match, 16*1024*1024)
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod_v2::entry_t));
 
