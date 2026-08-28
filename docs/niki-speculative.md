@@ -78,23 +78,32 @@ by ngram-mod, negating the speedup.
 
 ### The Solution
 
-A `skip_process` mechanism was added to the MTP implementation:
+A `skip_process` mechanism is used so MTP does not decode its `ctx_dft` while a
+higher-priority implementation is drafting:
 
 1. Before each draft round, MTP checks whether all sequences already have drafts
-   from a higher-priority implementation.
-2. If yes (`n_need_draft == 0`), MTP sets `skip_process = true` and returns
-   without doing any work. Its `need_process()` returns `false`, so the main
-   speculative loop skips `process()` entirely -- no KV cache sync, no decode.
-3. On the next round where ngram-mod cannot provide drafts for all sequences,
-   MTP detects `skip_process -> active` transition and sets `cold_start = true`.
-   In `cold_start` mode, it produces at most 1 draft token per sequence to avoid
-   verifying a long garbage sequence from stale KV cache state.
-4. After the first successful draft, `cold_start` is cleared and normal MTP
-   operation resumes.
+   from a higher-priority implementation. If yes (`n_need_draft == 0`), it sets
+   `skip_process = true` and returns without decoding `ctx_dft`.
+2. While skipped, `process()` is still invoked every round (its `need_process()`
+   always returns `true`), but instead of decoding `ctx_dft` it stashes the
+   target's nextn embeddings for every consumed token into a per-sequence
+   catch-up backlog. This is a cheap memcpy -- no GPU work.
+3. On the round where ngram-mod cannot provide drafts (`skip_process -> active`
+   transition), MTP drains the backlog in a single (possibly chunked)
+   `llama_decode` pass, replaying the stashed embeddings with the usual
+   one-position shift. This resyncs `ctx_dft` with `ctx_tgt` in one go, after
+   which full-depth drafting resumes immediately -- there is no cold start and
+   no "hole" in the draft context.
+4. The same drain is triggered by `common_speculative_flush()` before the draft
+   context is serialized into the slot / prompt cache (`prompt_save`,
+   `create_checkpoint`). This guarantees the saved `(ctx_tgt, ctx_dft)` pair is
+   consistent: otherwise, if ngram-mod drafted the whole assistant turn, `ctx_dft`
+   would be left stale across the turn boundary and restored stale on the next
+   agentic step (which also previously caused a silent loss of the prefill tokens
+   from `ctx_dft`).
 
-This is not the most elegant solution, but it is effective: it allows the
-combo of ngram-mod + MTP to deliver real speedups, whereas running both without
-this change would waste most of the gain on redundant MTP cache computation.
+This keeps the speedup of ngram-mod + MTP while avoiding both the redundant MTP
+decode and the stale-draft-context problems that a simpler cold-start approach had.
 
 ---
 
