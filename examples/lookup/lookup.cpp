@@ -219,7 +219,9 @@ int main(int argc, char ** argv){
 
     // Update dynamic ngram cache with context ngram cache and save it to disk:
     common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
-    common_ngram_cache_save(ngram_cache_dynamic, params.speculative.ngram_cache.lookup_cache_dynamic);
+    common_ngram_cache_save(ngram_cache_dynamic, params.speculative.ngram_cache.lookup_cache_dynamic,
+                            params.speculative.ngram_cache.save_max_entries,
+                            params.speculative.ngram_cache.save_max_file_size_mib);
 
     LOG("\n\n");
 

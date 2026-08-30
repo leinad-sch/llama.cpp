@@ -2105,7 +2105,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             common_ngram_cache_merge(dynamic_cache, sinfo.ngram_cache_context);
         }
 
-        common_ngram_cache_save(dynamic_cache, params.lookup_cache_dynamic);
+        common_ngram_cache_save(dynamic_cache, params.lookup_cache_dynamic,
+                                params.save_max_entries, params.save_max_file_size_mib);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {

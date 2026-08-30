@@ -1638,6 +1638,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ngram-cache-save-max-entries"}, "N",
+        "maximum entries written to dynamic cache file (0=unlimited)",
+        [](common_params & params, int value) {
+            params.speculative.ngram_cache.save_max_entries = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ngram-cache-save-max-file-size-mib"}, "N",
+        "maximum dynamic cache file size in MiB (0=unlimited)",
+        [](common_params & params, int value) {
+            params.speculative.ngram_cache.save_max_file_size_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-c", "--ctx-size"}, "N",
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {
