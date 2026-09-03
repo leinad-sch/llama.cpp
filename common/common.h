@@ -349,11 +349,28 @@ struct common_params_speculative_draft {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 
+enum class ngram_mod_cache_mode : uint8_t {
+    SHARED = 0,   // single cache shared across all sequences (current behavior)
+    PER_SLOT = 1  // one cache per sequence
+};
+
+inline const char * ngram_mod_cache_mode_name(ngram_mod_cache_mode m) {
+    return m == ngram_mod_cache_mode::SHARED ? "shared" : "per-slot";
+}
+
+inline bool ngram_mod_cache_mode_from_str(std::string_view s, ngram_mod_cache_mode & out) {
+    if (s == "shared")    { out = ngram_mod_cache_mode::SHARED;   return true; }
+    if (s == "per-slot")  { out = ngram_mod_cache_mode::PER_SLOT; return true; }
+    return false;
+}
+
 struct common_params_speculative_ngram_mod {
     int32_t n_match = 24;
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    ngram_mod_cache_mode cache_mode = ngram_mod_cache_mode::SHARED;
 };
 
 struct common_params_speculative_ngram_map {
