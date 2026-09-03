@@ -1864,8 +1864,16 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
-    // shared across all sequences
-    common_ngram_mod mod;
+    // cache mode (set in constructor initializer list)
+    ngram_mod_cache_mode cache_mode;
+
+    // SHARED mode: single mod shared across all sequences
+    // PER_SLOT mode: one mod per sequence
+    //
+    // NOTE: mod_shared is always initialized (even in PER_SLOT mode) to keep
+    // struct layout consistent. It is never accessed in PER_SLOT mode.
+    common_ngram_mod mod_shared;
+    std::vector<common_ngram_mod> mods_per_slot;
 
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
@@ -1885,24 +1893,72 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
+    // helper: return the ngram size n (same for all slots in PER_SLOT mode)
+    size_t get_n() const {
+        if (cache_mode == ngram_mod_cache_mode::SHARED) {
+            return mod_shared.get_n();
+        }
+        if (mods_per_slot.empty()) {
+            SPC_WRN("PER_SLOT mode: mods_per_slot is empty, returning 0\n");
+            return 0;
+        }
+        return mods_per_slot[0].get_n();
+    }
+
+    // helper: return the mod for the given sequence
+    // NOTE: caller must ensure seq_id is valid (0..n_seq-1)
+    common_ngram_mod& get_mod(llama_seq_id seq_id) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            SPC_WRN("invalid seq_id %d (n_seq=%d)\n", seq_id, n_seq);
+            GGML_ASSERT(false);
+            // In release builds, fall back to a safe value
+            // For SHARED mode: return the shared mod
+            // For PER_SLOT mode: this is a programming error, but return slot 0 as fallback
+            if (cache_mode == ngram_mod_cache_mode::SHARED) {
+                return mod_shared;
+            }
+            return mods_per_slot.empty() ? mod_shared : mods_per_slot[0];
+        }
+        if (cache_mode == ngram_mod_cache_mode::SHARED) {
+            return mod_shared;
+        }
+        return mods_per_slot[seq_id];
+    }
+
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , cache_mode(params.ngram_mod.cache_mode)
+        , mod_shared(params.ngram_mod.n_match, 4*1024*1024)  // always initialized
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
-        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
-                this->params.n_match, this->params.n_max, this->params.n_min);
-        SPC_TRC("- mod size=%zu (%.3f MB)\n",
-                mod.size(), (float)(mod.size_bytes())/1024/1024);
+        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d, cache_mode=%s\n",
+                this->params.n_match, this->params.n_max, this->params.n_min,
+                cache_mode == ngram_mod_cache_mode::SHARED ? "shared" : "per-slot");
 
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
                     "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
+        }
+
+        // Initialize per-slot caches if needed
+        if (cache_mode == ngram_mod_cache_mode::PER_SLOT) {
+            mods_per_slot.reserve(n_seq);
+            for (size_t i = 0; i < n_seq; ++i) {
+                mods_per_slot.emplace_back(params.ngram_mod.n_match, 4*1024*1024);
+            }
+            if (!mods_per_slot.empty()) {
+                SPC_TRC("- per-slot cache size=%zu (%.3f MB) x %d slots (%.3f MB total)\n",
+                        mods_per_slot.front().size(), (float)(mods_per_slot.front().size_bytes())/1024/1024,
+                        n_seq, (float)(mods_per_slot.front().size_bytes()*n_seq)/1024/1024);
+            }
+        } else {
+            SPC_TRC("- mod size=%zu (%.3f MB)\n",
+                    mod_shared.size(), (float)(mod_shared.size_bytes())/1024/1024);
         }
 
         sinfos.resize(n_seq);
@@ -1914,11 +1970,14 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
 
-        const size_t n = mod.get_n();
+        const size_t n = get_n();
         if (prompt.size() < n) {
             return;
         }
 
+        common_ngram_mod& mod = get_mod(seq_id);
+
+        // Add all n-grams (current behavior: add from start on each begin())
         for (size_t i = 0; i < prompt.size() - n; ++i) {
             mod.add(prompt.data() + i);
         }
@@ -1930,8 +1989,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         constexpr double f_thold = 0.25;
         if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
-
+            const char *label = cache_mode == ngram_mod_cache_mode::SHARED ? "shared" : "slot";
+            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting %s cache\n", f, f_thold, label);
             mod.reset();
         }
     }
@@ -1948,11 +2007,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.used_hashes.clear();
 
         const size_t cur_len = prompt.size();
-        if (cur_len < mod.get_n()) {
+        if (cur_len < get_n()) {
             return;
         }
 
-        const size_t n = mod.get_n();
+        const size_t n = get_n();
+        common_ngram_mod& mod = get_mod(seq_id);
 
         // add new ngrams in chunks
         if (sinfo.i_last + 32 < cur_len) {
@@ -2025,6 +2085,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
 
             // update per-ngram scores based on acceptance outcome
+            common_ngram_mod& mod = get_mod(seq_id);
             for (size_t i = 0; i < sinfo.n_draft_last; ++i) {
                 if (i < static_cast<size_t>(n_accepted)) {
                     mod.inc_score_by_index(sinfo.used_hashes[i]);
