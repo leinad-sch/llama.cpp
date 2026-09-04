@@ -1586,6 +1586,18 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "kv_cache_used_cells",
+            "Number of KV cache cells currently in use",
+            (double) kv_cache_used_cells
+        }, {
+            "kv_cache_total_cells",
+            "Total number of KV cache cells",
+            (double) kv_cache_total_cells
+        }, {
+            "kv_cache_usage_ratio",
+            "Ratio of KV cache cells currently in use",
+            kv_cache_total_cells ? (double) kv_cache_used_cells / kv_cache_total_cells : 0.
         },
     };
 

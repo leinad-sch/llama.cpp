@@ -2499,6 +2499,10 @@ private:
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
 
+                    const llama_memory_kv_cache_stats kv_cache_stats = llama_memory_get_kv_cache_stats(llama_get_memory(ctx_tgt));
+                    res->kv_cache_used_cells  = kv_cache_stats.used_cells;
+                    res->kv_cache_total_cells = kv_cache_stats.total_cells;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
