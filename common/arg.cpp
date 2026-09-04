@@ -4311,6 +4311,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
+        {"--spec-ngram-mod-cache-mode"}, "MODE",
+        string_format("ngram-mod cache mode: shared (default, ~%.1f MB RAM total) or per-slot (~%.1f MB per slot) (default: %s)",
+            (double)(4*1024*1024)/1024/1024,  // This is a simplification; actual size depends on n_match
+            (double)(4*1024*1024)/1024/1024,
+            ngram_mod_cache_mode_name(params.speculative.ngram_mod.cache_mode)),
+        [](common_params & params, const std::string & value) {
+            if (!ngram_mod_cache_mode_from_str(value, params.speculative.ngram_mod.cache_mode)) {
+                throw std::invalid_argument(string_format("invalid cache mode '%s': must be 'shared' or 'per-slot'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_CACHE_MODE"));
+
+    add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
         string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),
         [](common_params & params, int value) {
