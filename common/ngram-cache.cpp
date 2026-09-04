@@ -8,6 +8,7 @@
 #include <fstream>
 #include <thread>
 #include <algorithm>
+#include <vector>
 
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
                               std::vector<llama_token> & inp, int nnew, bool print_progress) {
@@ -197,9 +198,103 @@ void common_ngram_cache_draft(
     }
 }
 
-void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename) {
+// Helper: calculate estimated file size of one entry in bytes
+static size_t common_ngram_cache_entry_size(const common_ngram_cache_part & token_counts) {
+    return sizeof(common_ngram) + sizeof(int32_t) + token_counts.size() * (sizeof(llama_token) + sizeof(int32_t));
+}
+
+// Helper: compute effective ngram length (count non-null tokens)
+static int common_ngram_effective_length(const common_ngram & ngram) {
+    int len = 0;
+    for (int i = 0; i < LLAMA_NGRAM_MAX; ++i) {
+        if (ngram.tokens[i] != LLAMA_TOKEN_NULL) {
+            ++len;
+        }
+    }
+    return len;
+}
+
+// Helper: compute total count (sum of all next-token counts)
+static int32_t common_ngram_cache_part_total_count(const common_ngram_cache_part & part) {
+    int32_t total = 0;
+    for (std::pair<llama_token, int32_t> item : part) {
+        total += item.second;
+    }
+    return total;
+}
+
+// Evict low-scoring entries from an ngram cache to satisfy size limits.
+// NOTE: modifies ngram_cache in-place by erasing entries with lowest scores.
+// Sorts entries by weighted_count (total_count * effective_ngram_length) descending,
+// then evicts entries with the lowest score first.
+// Both max_entries and max_file_size_mib are enforced if specified.
+// Returns the number of entries evicted.
+int32_t common_ngram_cache_evict(common_ngram_cache & ngram_cache,
+                                 int32_t max_entries, int32_t max_file_size_mib) {
+    if (max_entries <= 0 && max_file_size_mib <= 0) {
+        return 0;
+    }
+
+    const size_t max_file_size_bytes = (size_t)max_file_size_mib * 1024 * 1024;
+    int32_t evicted = 0;
+
+    // Build a sorted list: (score, entry_ptr)
+    // Score = total_count * effective_ngram_length
+    // Accumulate total_size in the same pass
+    std::vector<std::pair<int64_t, common_ngram_cache::iterator>> sorted_entries;
+    sorted_entries.reserve(ngram_cache.size());
+    size_t total_size = 0;
+
+    for (auto it = ngram_cache.begin(); it != ngram_cache.end(); ++it) {
+        const int32_t total_count = common_ngram_cache_part_total_count(it->second);
+        const int effective_length = common_ngram_effective_length(it->first);
+        const int64_t score = (int64_t)total_count * effective_length;
+        sorted_entries.push_back(std::make_pair(score, it));
+        total_size += common_ngram_cache_entry_size(it->second);
+    }
+
+    // Sort by score descending (highest score first)
+    std::sort(sorted_entries.begin(), sorted_entries.end(),
+              [](const std::pair<int64_t, common_ngram_cache::iterator> & a,
+                 const std::pair<int64_t, common_ngram_cache::iterator> & b) {
+                return a.first > b.first;
+              });
+
+    // Remove entries from lowest score first until both limits are satisfied
+    while (!sorted_entries.empty()) {
+        // Check if limits are satisfied
+        if ((max_entries <= 0 || (int32_t)ngram_cache.size() <= max_entries) &&
+            (max_file_size_mib <= 0 || total_size <= max_file_size_bytes)) {
+            break;
+        }
+
+        // Remove the lowest-scoring entry
+        common_ngram_cache::iterator to_remove = sorted_entries.back().second;
+        total_size -= common_ngram_cache_entry_size(to_remove->second);
+        sorted_entries.pop_back();
+        ngram_cache.erase(to_remove);
+        ++evicted;
+    }
+
+    return evicted;
+}
+
+void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename,
+                             int32_t max_entries, int32_t max_file_size_mib) {
+    common_ngram_cache truncated_cache;
+    // Only copy if truncation is needed; otherwise iterate directly
+    common_ngram_cache & cache_to_save = ngram_cache;
+    if (max_entries > 0 || max_file_size_mib > 0) {
+        truncated_cache = ngram_cache;
+        common_ngram_cache_evict(truncated_cache, max_entries, max_file_size_mib);
+        cache_to_save = truncated_cache;
+    }
     std::ofstream file_out(filename, std::ios::binary);
-    for (std::pair<common_ngram, common_ngram_cache_part> item : ngram_cache) {
+    if (!file_out) {
+        LOG_ERR("failed to open cache file for writing: %s\n", filename.c_str());
+        return;
+    }
+    for (std::pair<common_ngram, common_ngram_cache_part> item : cache_to_save) {
         const common_ngram      ngram        = item.first;
         common_ngram_cache_part token_counts = item.second;
         GGML_ASSERT(!token_counts.empty());
