@@ -88,7 +88,10 @@ void common_ngram_cache_draft(
 // Save an ngram cache to a file.
 // ngram_cache: the ngram cache to save.
 // filename:    the path under which to save the ngram cache.
-void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename);
+// max_entries:     max entries written to file (0=unlimited)
+// max_file_size_mib: max file size in MiB (0=unlimited)
+void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename,
+                             int32_t max_entries = 0, int32_t max_file_size_mib = 0);
 
 // Load an ngram cache saved with common_ngram_cache_save.
 // filename: the path from which to load the ngram cache.
@@ -99,3 +102,12 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename);
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
 void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add);
+
+// Evict low-scoring entries from an ngram cache to satisfy size limits.
+// NOTE: modifies ngram_cache in-place by erasing entries with lowest scores.
+// Sorts entries by weighted_count (total_count * effective_ngram_length) descending,
+// then evicts entries with the lowest score first.
+// Both max_entries and max_file_size_mib are enforced if specified.
+// Returns the number of entries evicted.
+int32_t common_ngram_cache_evict(common_ngram_cache & ngram_cache,
+                                 int32_t max_entries = 0, int32_t max_file_size_mib = 0);
