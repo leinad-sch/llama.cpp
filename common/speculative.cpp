@@ -178,6 +178,13 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) per-seq reset/flush hooks and process/embd gates.
+    // Defaults are no-ops so implementations that do not need them still compile.
+    virtual void reset(llama_seq_id /*seq_id*/) {}
+    virtual void flush(llama_seq_id /*seq_id*/) {}
+    virtual bool need_process() const { return true; }
+    virtual bool need_embd() const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2166,6 +2173,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // number of tokens accepted from the last draft
         int n_accepted_last = 0;
+
+        // consecutive low-acceptance streak counter (drives score-based pruning)
+        int n_low = 0;
+
         // hash indices of ngrams consulted during the most recent draft
         std::vector<size_t> used_hashes;
     };
@@ -2224,19 +2235,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
         }
 
+        // load the cache into the shared mod (always initialized, even in PER_SLOT mode)
         if (!this->params.cache_file.empty()) {
             LOG_INF("%s: loading ngram_mod cache from '%s'\n", __func__, this->params.cache_file.c_str());
-            if (mod.load(this->params.cache_file)) {
-                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), (double)mod.get_used()/(double)mod.size());
-            } else {
-                LOG_INF("%s: - no existing cache, starting fresh\n", __func__);
-            }
-        }
-
-        if (!this->params.cache_file.empty()) {
-            LOG_INF("%s: loading ngram_mod cache from '%s'\n", __func__, this->params.cache_file.c_str());
-            if (mod.load(this->params.cache_file)) {
-                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), (double)mod.get_used()/(double)mod.size());
+            if (mod_shared.load(this->params.cache_file)) {
+                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod_shared.get_used(), mod_shared.size(), (double)mod_shared.get_used()/(double)mod_shared.size());
             } else {
                 LOG_INF("%s: - no existing cache, starting fresh\n", __func__);
             }
@@ -2264,8 +2267,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     ~common_speculative_impl_ngram_mod() override {
         if (!params.cache_file.empty()) {
             LOG_INF("%s: saving ngram_mod cache to '%s' (used=%zu/%zu)\n", __func__,
-                    params.cache_file.c_str(), mod.get_used(), mod.size());
-            if (!mod.save(params.cache_file)) {
+                    params.cache_file.c_str(), mod_shared.get_used(), mod_shared.size());
+            if (!mod_shared.save(params.cache_file)) {
                 LOG_WRN("%s: failed to save ngram_mod cache to '%s'\n", __func__, params.cache_file.c_str());
             }
         }
@@ -2424,46 +2427,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     mod.prune_low_score();
                     sinfo.n_low = 0;
                 }
-
-                result.resize(n + i);
-                break;
-            }
-            result[n + i] = token;
-        }
-
-        for (size_t i = 0; n + i < result.size(); ++i) {
-            result[i] = result[n + i];
-        }
-        result.resize(result.size() - n);
-
-        sinfo.n_draft_last = result.size();
-    }
-
-    bool process(const llama_batch & /*batch*/) override {
-        return true;
-    }
-
-    void draft(common_speculative_draft_params_vec & dparams) override {
-        assert(dparams.size() == n_seq);
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
+            } else {
+                sinfo.n_low = 0;
             }
 
-            draft_one(seq_id, dp);
-        }
-    }
-
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
-        if (is_other) {
-            return;
-        }
-
-        auto & sinfo = sinfos[seq_id];
-
-        if (sinfo.n_draft_last > 0) {
+            // record acceptance for adaptive draft length
             sinfo.n_accepted_last = n_accepted;
         }
         sinfo.used_hashes.clear();
@@ -2488,7 +2456,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
     common_speculative_impl_ngram_mod_v2(
             const common_params_speculative & params,
             uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
         , mod(params.ngram_mod.n_match, 16*1024*1024)
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
