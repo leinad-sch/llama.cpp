@@ -4783,8 +4783,6 @@ private:
             }
         }
 
-        int32_t i_next = 0;
-
         // detect speculative verification slots
         std::vector<llama_seq_id> spec_slots;
         for (const auto & slot : slots) {
@@ -4793,8 +4791,6 @@ private:
             }
         }
         const int64_t t_v_start = !spec_slots.empty() ? ggml_time_us() : -1;
-
-        const int ret = llama_decode(ctx_tgt, batch_view);
 
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
