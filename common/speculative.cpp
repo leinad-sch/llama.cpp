@@ -1882,8 +1882,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // for the MTP shift this is still correct: id_last's hidden (pending_h) seeds the
             // row at head+1, which predicts the token at head+1.
             const int32_t dft_head = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-            if (dp.n_past <= dft_head) {
-                dp.n_past = dft_head + 1;
+            if (dp.pos0 <= dft_head) {
+                dp.pos0 = dft_head + 1;
             }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
