@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <optional>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -298,9 +299,22 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache) {
         if (prompt.tokens.size() == 0) {
             return false;
+        }
+
+        // bring the draft context (ctx_dft) in sync with the target before serializing it
+        // into the slot cache, so the saved pair (ctx_tgt, ctx_dft) is consistent. otherwise a
+        // backlog accumulated while a higher-priority draft impl (ngram-mod) was skipping MTP
+        // would be written stale and restored stale on the next turn.
+        if (spec) {
+            common_speculative_flush(spec, id);
+            // if flush failed (e.g. decode error) ctx_dft is still stale - don't save inconsistent pair
+            if (ctx_dft && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) !=
+                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id)) {
+                return false;
+            }
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2403,6 +2417,16 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // sync the draft context before saving it into the checkpoint, otherwise the
+        // backlog accumulated while MTP was skipped would be persisted stale.
+        if (spec) {
+            common_speculative_flush(spec.get(), slot.id);
+            if (ctx_dft && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) !=
+                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)) {
+                // flush failed - skip checkpoint to avoid persisting stale ctx_dft
+                return;
+            }
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3316,6 +3340,16 @@ private:
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
+                        // reset the speculative sampler (incl. MTP skip/catch-up state) BEFORE the
+                        // prompt is prefilled. doing this only at generation start would leave a stale
+                        // skip_process from the previous task, causing the prefill to stash embeddings
+                        // instead of syncing ctx_dft (draft KV then lags the target by the prefill size).
+                        // reset() is the lightweight counterpart of begin(): it clears the backlog
+                        // without emitting the (post-prefill) sync warning.
+                        if (spec) {
+                            common_speculative_reset(spec.get(), slot.id);
+                        }
+
                         // print prompt tokens (for debugging)
                         /*if (1) {
                             // first 16 tokens (avoid flooding logs)
@@ -3853,6 +3887,15 @@ private:
             }
         }
 
+        // detect speculative verification slots
+        std::vector<llama_seq_id> spec_slots;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
+                spec_slots.push_back(slot.id);
+            }
+        }
+        const int64_t t_v_start = !spec_slots.empty() ? ggml_time_us() : -1;
+
         bool has_output = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
@@ -3873,8 +3916,6 @@ private:
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
                 }
 
@@ -3883,11 +3924,8 @@ private:
                 }
 
                 if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
                 }
-
-                // TODO: handle ret == 2 (abort) when we start aborting
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
@@ -3903,12 +3941,10 @@ private:
                         }
                     }
 
-                    // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
                 n_batch /= 2;
             }
@@ -3921,9 +3957,14 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        // accumulate speculative verification time for this sub-batch
+        if (t_v_start > 0) {
+            const int64_t dt = ggml_time_us() - t_v_start;
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, dt);
+            }
+        }
+
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
@@ -3933,7 +3974,7 @@ private:
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
-                // TODO: handle error
+
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
@@ -3948,8 +3989,6 @@ private:
                     }
                 }
 
-                // all children slots should already launched by launch_slots_with_parent_task()
-                // copy state to the child slots
                 for (auto & child : children) {
                     SLT_TRC(slot, " - copying state to child %d\n", child->id);
 
