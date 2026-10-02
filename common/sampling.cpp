@@ -695,6 +695,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         // do not accept draft tokens after an EOG - they are not output but would stay in the context
         // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
         if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+            const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+            LOG_DBG("[issue#23268] VERIFY_FAIL: idx=%zu draft=%d (logit=%.4f) sampled=%d (logit=%.4f)\n",
+                    i, draft[i], logits[draft[i]], id, logits[id]);
             break;
         }
     }
