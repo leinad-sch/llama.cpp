@@ -497,6 +497,9 @@ struct server_task_result_metrics : server_task_result {
 
     server_metrics metrics;
 
+    uint64_t kv_cache_used_cells  = 0;
+    uint64_t kv_cache_total_cells = 0;
+
     virtual json to_json() override;
 
     struct metric_item {

@@ -730,6 +730,10 @@ bool llama_memory_recurrent::get_can_shift() const {
     return true;
 }
 
+llama_memory_kv_cache_stats llama_memory_recurrent::get_kv_cache_stats() const {
+    return {};
+}
+
 bool llama_memory_recurrent::is_empty() const {
     const bool res = ctxs_bufs.empty();
     assert(!res || total_size() == 0);
