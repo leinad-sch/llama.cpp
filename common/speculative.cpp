@@ -1731,8 +1731,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     auto & cu = catchup[seq_id];
                     for (int k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
                         const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k);
-                        const llama_pos   pos = batch_in.pos[k];
-                        const llama_token tok = batch_in.token[k];
+                        const llama_pos   pos = batch_in.tokens[k].pos[0];
+                        const llama_token tok = batch_in.tokens[k].id;
                         // the context-token re-feed re-stashes the previous round's last committed
                         // token over a rejected draft tail at the same position (always the back
                         // when it happens). replace in place to keep the committed embedding.
@@ -1927,15 +1927,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t csize = b - a;
             (void) csize;
 
-            common_batch_clear(batch);
+            batch.clear();
+            std::vector<int32_t> idxs;
+            idxs.reserve(b - a);
             for (int32_t k = a; k < b; ++k) {
-                common_batch_add(batch, cu[k].id, cu[k].pos, { seq_id }, false);
+                idxs.push_back(batch.add(cu[k].id, cu[k].pos, seq_id, false));
             }
 
             // shift-by-one embedding layout
-            std::memcpy(batch.embd + (size_t) 0 * n_embd, seed, row_bytes);
+            batch.set_embd(idxs[0], { seed, 1, n_embd });
             for (int32_t k = a + 1; k < b; ++k) {
-                std::memcpy(batch.embd + (size_t) k * n_embd, cu[k - 1].emb.data(), row_bytes);
+                batch.set_embd(idxs[k - a], { cu[k - 1].emb.data(), 1, n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1944,9 +1946,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_memory_seq_rm(mem_dft, seq_id, cu[a].pos, -1);
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) cu[a].pos);
                     return;
                 }
@@ -2122,13 +2124,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
-
-                result.push_back(id);
-
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
@@ -2168,9 +2163,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
-            ret = llama_decode(ctx_dft, batch);
+            ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
-                LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
+                LOG_WRN("%s: llama_process[%d] returned %d\n", __func__, i, ret);
                 break;
             }
 
@@ -2747,7 +2742,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const common_batch & /*batch*/) override {
         return true;
     }
 
