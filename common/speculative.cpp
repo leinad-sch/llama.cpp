@@ -1935,9 +1935,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // shift-by-one embedding layout
-            batch.set_embd(idxs[0], { seed, 1, n_embd });
+            batch.set_embd(idxs[0], { seed, 1, (size_t) n_embd });
             for (int32_t k = a + 1; k < b; ++k) {
-                batch.set_embd(idxs[k - a], { cu[k - 1].emb.data(), 1, n_embd });
+                batch.set_embd(idxs[k - a], { cu[k - 1].emb.data(), 1, (size_t) n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
