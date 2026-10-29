@@ -5065,7 +5065,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 
-                const int32_t issue_23268_fail_batch_idx = slot.spec_i_batch[accepted.size() - 1];
+                const int32_t issue_23268_fail_batch_idx = spec_i_batch[accepted.size() - 1];
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
