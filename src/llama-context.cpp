@@ -3601,8 +3601,14 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+        if (nread > state_size) {
+            LLAMA_LOG_ERROR("%s: corrupted sequence state file (read %zu bytes, state size %zu)\n", __func__, nread, state_size);
+            return 0;
+        }
+        if (nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out != file.tell()) {
+            LLAMA_LOG_ERROR("%s: corrupted sequence state file (unexpected end offset %zu, expected %zu)\n", __func__, file.tell(), nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out);
+            return 0;
+        }
     }
 
     return file.tell();
