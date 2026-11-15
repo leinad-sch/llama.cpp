@@ -3611,16 +3611,6 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
-        // detect speculative verification slots before decoding, so we can attribute
-        // the verification time to the affected slots
-        std::vector<llama_seq_id> spec_slots;
-        for (const auto & slot : slots) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
-                spec_slots.push_back(slot.id);
-            }
-        }
-        int64_t t_verify_acc = 0;
-
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3630,7 +3620,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off, t_verify_acc, spec_slots);
+                bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -4636,7 +4626,7 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, int64_t & t_verify_acc, const std::vector<llama_seq_id> & spec_slots) {
+    bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4662,7 +4652,14 @@ private:
             }
         }
 
-        const int64_t t_v_start = spec_slots.empty() ? -1 : ggml_time_us();
+        // detect speculative verification slots
+        std::vector<llama_seq_id> spec_slots;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
+                spec_slots.push_back(slot.id);
+            }
+        }
+        const int64_t t_v_start = !spec_slots.empty() ? ggml_time_us() : -1;
 
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
@@ -4684,8 +4681,6 @@ private:
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
                 }
 
@@ -4694,11 +4689,8 @@ private:
                 }
 
                 if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
                 }
-
-                // TODO: handle ret == 2 (abort) when we start aborting
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
@@ -4714,12 +4706,10 @@ private:
                         }
                     }
 
-                    // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
                 n_batch /= 2;
             }
@@ -4728,17 +4718,18 @@ private:
 
             return false; // retry with the updated n_batch
         } else {
-            if (t_v_start > 0) {
-                t_verify_acc += ggml_time_us() - t_v_start;
-            }
-
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        // accumulate speculative verification time for this sub-batch
+        if (t_v_start > 0) {
+            const int64_t dt = ggml_time_us() - t_v_start;
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, dt);
+            }
+        }
+
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
@@ -4748,7 +4739,6 @@ private:
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
-                // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
@@ -4763,8 +4753,6 @@ private:
                     }
                 }
 
-                // all children slots should already launched by launch_slots_with_parent_task()
-                // copy state to the child slots
                 for (auto & child : children) {
                     SLT_TRC(slot, " - copying state to child %d\n", child->id);
 
@@ -5087,12 +5075,6 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-            }
-        }
-
-        if (t_verify_acc > 0) {
-            for (const auto & sid : spec_slots) {
-                common_speculative_add_verify_time(spec.get(), sid, t_verify_acc);
             }
         }
 
