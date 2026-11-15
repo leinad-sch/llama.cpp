@@ -2,7 +2,9 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #if defined(_WIN32)
@@ -96,6 +98,7 @@ bool common_ngram_mod_v2::save(const std::string & path) const {
     const std::string tmp_path = path + ".tmp";
     FILE * f = fopen(tmp_path.c_str(), "wb");
     if (!f) {
+        LOG_WRN("%s: fopen('%s') failed: %s\n", __func__, tmp_path.c_str(), std::strerror(errno));
         return false;
     }
 
@@ -117,28 +120,33 @@ bool common_ngram_mod_v2::save(const std::string & path) const {
     if (fflush(f) != 0) {
         fclose(f);
         remove(tmp_path.c_str());
+        LOG_WRN("%s: fflush failed: %s\n", __func__, std::strerror(errno));
         return false;
     }
 #if defined(_WIN32)
     if (_commit(_fileno(f)) != 0) {
         fclose(f);
         remove(tmp_path.c_str());
+        LOG_WRN("%s: _commit failed: %s\n", __func__, std::strerror(errno));
         return false;
     }
 #else
     if (fsync(fileno(f)) != 0) {
         fclose(f);
         remove(tmp_path.c_str());
+        LOG_WRN("%s: fsync failed: %s\n", __func__, std::strerror(errno));
         return false;
     }
 #endif
     if (fclose(f) != 0) {
         remove(tmp_path.c_str());
+        LOG_WRN("%s: fclose failed: %s\n", __func__, std::strerror(errno));
         return false;
     }
 
     if (rename(tmp_path.c_str(), path.c_str()) != 0) {
         remove(tmp_path.c_str());
+        LOG_WRN("%s: rename('%s' -> '%s') failed: %s\n", __func__, tmp_path.c_str(), path.c_str(), std::strerror(errno));
         return false;
     }
 
