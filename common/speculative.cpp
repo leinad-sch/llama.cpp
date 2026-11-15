@@ -225,6 +225,9 @@ struct common_speculative_impl {
     // (e.g. MTP draining its catch-up backlog) before serializing into the prompt cache.
     virtual void flush(llama_seq_id /*seq_id*/) {}
 
+    // when false, the impl does not read the target embeddings carried in the batch
+    virtual bool need_embd() const { return false; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -3102,6 +3105,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     mod.prune_low_score();
                     sinfo.n_low = 0;
                 }
+            } else {
+                sinfo.n_low = 0;
             }
         }
 
