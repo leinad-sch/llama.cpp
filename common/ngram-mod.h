@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <cstddef>
 
@@ -22,6 +23,21 @@ struct common_ngram_mod {
     entry_t get(const entry_t * tokens) const; // return -1 if not found
 
     void reset();
+
+    // expose the hash index for external bookkeeping
+    size_t index(const entry_t * tokens) const;
+
+    // score handling
+    void inc_score(const entry_t * tokens);
+    void dec_score(const entry_t * tokens);
+    void inc_score_by_index(size_t i);
+    void dec_score_by_index(size_t i);
+    void prune_low_score(); // remove entries below SCORE_THR
+
+    // save/load the hash table to/from a file (atomic write on save)
+    // returns true on success, false on error (load silently starts empty on failure)
+    bool save(const std::string & path) const;
+    bool load(const std::string & path);
 
     size_t get_n()    const;
     size_t get_used() const;
