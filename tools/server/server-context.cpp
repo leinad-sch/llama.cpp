@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
+#include <optional>
 #include <exception>
 #include <memory>
 #include <filesystem>
