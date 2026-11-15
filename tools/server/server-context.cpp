@@ -3648,6 +3648,16 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // detect speculative verification slots before decoding, so we can attribute
+        // the verification time to the affected slots
+        std::vector<llama_seq_id> spec_slots;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
+                spec_slots.push_back(slot.id);
+            }
+        }
+        int64_t t_verify_acc = 0;
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3657,7 +3667,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off);
+                bool ok = decode(n_batch, off, t_verify_acc, spec_slots);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -4676,7 +4686,7 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off) {
+    bool decode(int32_t & n_batch, int32_t off, int64_t & t_verify_acc, const std::vector<llama_seq_id> & spec_slots) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4701,6 +4711,8 @@ private:
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
             }
         }
+
+        const int64_t t_v_start = spec_slots.empty() ? -1 : ggml_time_us();
 
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
@@ -4766,6 +4778,10 @@ private:
 
             return false; // retry with the updated n_batch
         } else {
+            if (t_v_start > 0) {
+                t_verify_acc += ggml_time_us() - t_v_start;
+            }
+
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
         }
@@ -5121,7 +5137,16 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-        });
+            }
+        }
+
+        if (t_verify_acc > 0) {
+            for (const auto & sid : spec_slots) {
+                common_speculative_add_verify_time(spec.get(), sid, t_verify_acc);
+            }
+        }
+
+        SRV_DBG("%s", "run slots completed\n");
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
