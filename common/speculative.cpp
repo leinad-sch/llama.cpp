@@ -2804,6 +2804,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             mods_per_slot.reserve(n_seq);
             for (size_t i = 0; i < n_seq; ++i) {
                 mods_per_slot.emplace_back(params.ngram_mod.n_match, 4*1024*1024);
+                if (!this->params.cache_file.empty()) {
+                    mods_per_slot[i].load(this->params.cache_file);
+                }
             }
             if (!mods_per_slot.empty()) {
                 SPC_TRC("- per-slot cache size=%zu (%.3f MB) x %d slots (%.3f MB total)\n",
