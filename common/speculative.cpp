@@ -2728,6 +2728,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         int n_accepted_last = 0;
         // hash indices of ngrams consulted during the most recent draft
         std::vector<size_t> used_hashes;
+
+        // streak of consecutive drafts with low acceptance
+        int n_low = 0;
     };
 
     std::vector<seq_info> sinfos;
@@ -2738,7 +2741,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             return mod_shared.get_n();
         }
         if (mods_per_slot.empty()) {
-            SPC_WRN("PER_SLOT mode: mods_per_slot is empty, returning 0\n");
+            SPC_WRN("%s", "PER_SLOT mode: mods_per_slot is empty, returning 0");
             return 0;
         }
         return mods_per_slot[0].get_n();
@@ -2786,17 +2789,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         if (!this->params.cache_file.empty()) {
             LOG_INF("%s: loading ngram_mod cache from '%s'\n", __func__, this->params.cache_file.c_str());
-            if (mod.load(this->params.cache_file)) {
-                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), (double)mod.get_used()/(double)mod.size());
-            } else {
-                LOG_INF("%s: - no existing cache, starting fresh\n", __func__);
-            }
-        }
-
-        if (!this->params.cache_file.empty()) {
-            LOG_INF("%s: loading ngram_mod cache from '%s'\n", __func__, this->params.cache_file.c_str());
-            if (mod.load(this->params.cache_file)) {
-                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), (double)mod.get_used()/(double)mod.size());
+            if (mod_shared.load(this->params.cache_file)) {
+                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod_shared.get_used(), mod_shared.size(), (double)mod_shared.get_used()/(double)mod_shared.size());
             } else {
                 LOG_INF("%s: - no existing cache, starting fresh\n", __func__);
             }
@@ -2824,8 +2818,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     ~common_speculative_impl_ngram_mod() override {
         if (!params.cache_file.empty()) {
             LOG_INF("%s: saving ngram_mod cache to '%s' (used=%zu/%zu)\n", __func__,
-                    params.cache_file.c_str(), mod.get_used(), mod.size());
-            if (!mod.save(params.cache_file)) {
+                    params.cache_file.c_str(), mod_shared.get_used(), mod_shared.size());
+            if (!mod_shared.save(params.cache_file)) {
                 LOG_WRN("%s: failed to save ngram_mod cache to '%s'\n", __func__, params.cache_file.c_str());
             }
         }
@@ -2837,6 +2831,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_accepted_last = 0;
+        sinfo.n_low = 0;
 
         const size_t n = get_n();
         if (prompt.size() < n) {
@@ -3004,7 +2999,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
     common_speculative_impl_ngram_mod_v2(
             const common_params_speculative & params,
             uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
         , mod(params.ngram_mod.n_match, 16*1024*1024)
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
@@ -3125,7 +3120,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const common_batch & /*batch*/) override {
         return true;
     }
 
@@ -3152,10 +3147,6 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
         if (sinfo.n_draft_last > 0) {
             sinfo.n_accepted_last = n_accepted;
         }
-    }
-
-    bool need_embd() const override {
-        return false;
     }
 };
 

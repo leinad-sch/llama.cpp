@@ -16,6 +16,7 @@
 
 common_ngram_mod::common_ngram_mod(uint16_t n, size_t size) : n(n), used(0) {
     entries.resize(size);
+    scores.resize(size, SCORE_INIT);
 
     reset();
 }
@@ -37,6 +38,7 @@ void common_ngram_mod::add(const entry_t * tokens) {
 
     if (entries[i] == EMPTY) {
         used++;
+        scores[i] = SCORE_INS;
     }
 
     entries[i] = tokens[n];
@@ -50,6 +52,7 @@ common_ngram_mod::entry_t common_ngram_mod::get(const entry_t * tokens) const {
 
 void common_ngram_mod::reset() {
     std::fill(entries.begin(), entries.end(), EMPTY);
+    std::fill(scores.begin(), scores.end(), SCORE_INIT);
     used = 0;
 }
 
@@ -172,5 +175,49 @@ size_t common_ngram_mod::size() const {
 }
 
 size_t common_ngram_mod::size_bytes() const {
-    return entries.size() * sizeof(entries[0]);
+    return entries.size() * sizeof(entries[0]) + scores.size() * sizeof(scores[0]);
+}
+
+size_t common_ngram_mod::index(const entry_t * tokens) const {
+    return idx(tokens);
+}
+
+void common_ngram_mod::inc_score(const entry_t * tokens) {
+    const size_t i = idx(tokens);
+    if (scores[i] < common_ngram_mod::SCORE_MAX) {
+        ++scores[i];
+    }
+}
+
+void common_ngram_mod::dec_score(const entry_t * tokens) {
+    const size_t i = idx(tokens);
+    if (scores[i] > common_ngram_mod::SCORE_MIN) {
+        --scores[i];
+    }
+}
+
+void common_ngram_mod::inc_score_by_index(size_t i) {
+    if (i < scores.size() && scores[i] < common_ngram_mod::SCORE_MAX) {
+        ++scores[i];
+    }
+}
+
+void common_ngram_mod::dec_score_by_index(size_t i) {
+    if (i < scores.size() && scores[i] > common_ngram_mod::SCORE_MIN) {
+        --scores[i];
+    }
+}
+
+void common_ngram_mod::prune_low_score() {
+    used = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i] != EMPTY) {
+            if (scores[i] < common_ngram_mod::SCORE_THR) {
+                entries[i] = EMPTY;
+                scores[i] = 0;
+            } else {
+                ++used;
+            }
+        }
+    }
 }

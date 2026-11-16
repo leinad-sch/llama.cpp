@@ -5108,8 +5108,7 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-            }
-        }
+        });
 
         SRV_DBG("%s", "run slots completed\n");
     }

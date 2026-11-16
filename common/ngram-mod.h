@@ -16,6 +16,12 @@ struct common_ngram_mod {
 
     static constexpr entry_t EMPTY = -1;
 
+    static constexpr int8_t SCORE_INIT = 0;
+    static constexpr int8_t SCORE_MIN  = -5;
+    static constexpr int8_t SCORE_MAX  = 20;
+    static constexpr int8_t SCORE_THR  = 0;
+    static constexpr int8_t SCORE_INS  = 3;
+
     common_ngram_mod(uint16_t n, size_t size);
 
     size_t  idx(const entry_t * tokens) const;
@@ -51,4 +57,6 @@ private:
     size_t used;
 
     std::vector<entry_t> entries;
+    // per-entry score, range SCORE_MIN .. SCORE_MAX
+    std::vector<int8_t> scores;
 };
