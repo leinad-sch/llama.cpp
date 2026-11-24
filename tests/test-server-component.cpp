@@ -360,27 +360,27 @@ static void test_server_prompt_reuse(testing & t) {
         const auto prompt = make_prompt({{95, 95}, {99, 99}, {105, 105}});
         const llama_pos pos_min = 109;
 
-        auto res = prompt.get_reuse(110, true, 0, pos_min);
+        auto res = prompt.get_reuse(110, true, 0, pos_min, false);
         t.assert_true("new tokens after the prompt, no checkpoint", res.ckpt == nullptr);
         t.assert_equal("new tokens after the prompt, n_past", 110, res.n_past);
 
-        res = prompt.get_reuse(110, false, 0, pos_min);
+        res = prompt.get_reuse(110, false, 0, pos_min, false);
         t.assert_true("same prompt, last checkpoint", res.ckpt && res.ckpt->pos_max == 105);
         t.assert_equal("same prompt, n_past", 106, res.n_past);
         t.assert_equal("same prompt, pos_next", 106, res.pos_next);
 
         // the closest checkpoint before the new tokens is used, the one after them is not
-        res = prompt.get_reuse(104, true, 0, pos_min);
+        res = prompt.get_reuse(104, true, 0, pos_min, false);
         t.assert_true("cut at 104, checkpoint", res.ckpt && res.ckpt->pos_max == 99);
         t.assert_equal("cut at 104, n_past", 100, res.n_past);
         t.assert_equal("cut at 104, pos_next", 100, res.pos_next);
 
         // the state at 99 already holds the token at 99, it cannot be used to process it again
-        res = prompt.get_reuse(99, true, 0, pos_min);
+        res = prompt.get_reuse(99, true, 0, pos_min, false);
         t.assert_true("cut at 99, checkpoint", res.ckpt && res.ckpt->pos_max == 95);
         t.assert_equal("cut at 99, n_past", 96, res.n_past);
 
-        res = prompt.get_reuse(50, true, 0, pos_min);
+        res = prompt.get_reuse(50, true, 0, pos_min, false);
         t.assert_true("cut at 50, no checkpoint", res.ckpt == nullptr);
         t.assert_equal("cut at 50, n_past", 0, res.n_past);
         t.assert_equal("cut at 50, pos_next", 0, res.pos_next);
@@ -391,17 +391,17 @@ static void test_server_prompt_reuse(testing & t) {
         const auto prompt = make_prompt({{92, 99}});
         const llama_pos pos_min = 102;
 
-        auto res = prompt.get_reuse(110, true, 8, pos_min);
+        auto res = prompt.get_reuse(110, true, 8, pos_min, false);
         t.assert_true("new tokens after the prompt, no checkpoint", res.ckpt == nullptr);
         t.assert_equal("new tokens after the prompt, n_past", 110, res.n_past);
 
         // the token at 104 needs the positions 97 to 103, the live state starts too late for a cut at 104
-        res = prompt.get_reuse(104, true, 8, pos_min);
+        res = prompt.get_reuse(104, true, 8, pos_min, false);
         t.assert_true("cut at 104, checkpoint", res.ckpt != nullptr);
         t.assert_equal("cut at 104, n_past", 99, res.n_past);
         t.assert_equal("cut at 104, pos_next", 99, res.pos_next);
 
-        res = prompt.get_reuse(95, true, 8, pos_min);
+        res = prompt.get_reuse(95, true, 8, pos_min, false);
         t.assert_true("cut at 95, no checkpoint", res.ckpt == nullptr);
         t.assert_equal("cut at 95, n_past", 0, res.n_past);
     });
