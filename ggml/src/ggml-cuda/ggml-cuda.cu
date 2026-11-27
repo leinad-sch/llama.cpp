@@ -36,8 +36,11 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf-narrow.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/q4k-skinny.cuh"
+#include "ggml-cuda/q8-skinny.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -2204,6 +2207,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 // returns true if a scaled matmul applied its weight scale in-kernel (mmvq/mmq epilogue or cuBLASLt fp8 fold),
 // so the caller can skip the separate ggml_cuda_op_mul_mat_scale pass
 static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2220,6 +2226,16 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (scale_fold) {
         fusion.x_scale   = ggml_get_src_scale(dst, 0);
         fusion.prec_src1 = ggml_prec_get_src(dst, 1);
+    }
+
+    // skinny-repacked weights use a Volta-tuned layout, dispatch to the dedicated kernels
+    if (ggml_cuda_q8_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_q8_skinny(ctx, src0, src1, dst);
+        return false;
+    }
+    if (ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_q4k_skinny(ctx, src0, src1, dst);
+        return false;
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2284,6 +2300,58 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
     return false;
+}
+
+static const half * use_half(const ggml_tensor * src, cudaStream_t stream) {
+    (void) src;
+    (void) stream;
+    // the fork's hc_active_cache F32->F16 input cache is not ported; the skinny kernels
+    // convert the F32 input internally when input_f16 is null
+    return nullptr;
+}
+
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_q8_skinny_mul_mat(ctx, src0, src1, dst, ggml_cuda_q8_skinny_is_repacked(src0) && src1->ne[1] <= 64 ? use_half(src1, ctx.stream()) : nullptr)) {
+        return;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_q8_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+}
+
+static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_q4k_skinny_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_q4k_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -3518,6 +3586,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // repack eligible Q4_K / Q8_0 weights into the Volta-tuned skinny layout before fusion/dispatch
+    ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
+    ggml_cuda_q4k_skinny_prepass(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

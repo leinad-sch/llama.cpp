@@ -9,6 +9,8 @@
 #include "mmq-few.cuh"
 #include "mmvf.cuh"
 #include "mmvq.cuh"
+#include "q4k-skinny.cuh"
+#include "q8-skinny.cuh"
 #include "moe-weighted-reduction.cuh"
 #include "norm.cuh"
 #include "rope.cuh"
@@ -38,6 +40,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
 
     if (has_bias && (!ffn_up_bias || !ffn_gate_bias)) {
+        return false;
+    }
+
+    // do not fuse a skinny-repacked weight (its data layout differs from the standard quant layout)
+    if (ggml_cuda_q8_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0]) ||
+            ggml_cuda_q8_skinny_is_repacked(ffn_gate->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0])) {
         return false;
     }
 
@@ -116,6 +124,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // do not fuse a skinny-repacked weight (its data layout differs from the standard quant layout)
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -152,6 +165,11 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    // do not fuse a skinny-repacked weight (its data layout differs from the standard quant layout)
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -1949,6 +1967,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // do not fuse a skinny-repacked weight (its data layout differs from the standard quant layout)
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            (ggml_cuda_q8_skinny_is_repacked(node->src[0]) || ggml_cuda_q4k_skinny_is_repacked(node->src[0]))) {
+        return 0;
+    }
 
     // a scaled matmul only takes part in the gate/up/GLU fusion, which passes its weight scale on
     const bool scaled_mm = (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && ggml_get_src_scale(node, 0);
