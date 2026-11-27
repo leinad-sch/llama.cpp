@@ -867,6 +867,12 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     device(device),
     name(GGML_CUDA_NAME + std::to_string(device)),
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
+    if (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA) {
+        const size_t bytes = sizeof(unsigned int) * GGML_CUDA_MAX_STREAMS * GGML_CUDA_MAX_SPLIT_TILES;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc((void **) &tile_counters, bytes));
+        CUDA_CHECK(cudaMemset(tile_counters, 0, bytes));
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -994,6 +1000,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (tile_counters != nullptr) {
+        CUDA_CHECK(cudaFree(tile_counters));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {

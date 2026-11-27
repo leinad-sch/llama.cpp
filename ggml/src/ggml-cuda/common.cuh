@@ -200,6 +200,8 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
+#define GGML_CUDA_MAX_SPLIT_TILES 64
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -1415,6 +1417,10 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+
+    int q8_skinny_idle_scans = 0;
+
+    unsigned int * tile_counters = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
