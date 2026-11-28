@@ -1169,6 +1169,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows_back(x)",
     "set_rows(x)",
     "diag(x)",
+    "diag_mask_inf(x)",
+    "diag_mask_zero(x)",
     "soft_max(x)",
     "soft_max_back(x)",
     "rope(x)",
@@ -4156,6 +4158,70 @@ struct ggml_tensor * ggml_diag(
     result->src[0] = a;
 
     return result;
+}
+
+// ggml_diag_mask_inf
+
+static struct ggml_tensor * ggml_diag_mask_inf_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past,
+        bool                  inplace) {
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    int32_t params[] = { n_past };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DIAG_MASK_INF;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_diag_mask_inf(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_inf_impl(ctx, a, n_past, false);
+}
+
+struct ggml_tensor * ggml_diag_mask_inf_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_inf_impl(ctx, a, n_past, true);
+}
+
+// ggml_diag_mask_zero
+
+static struct ggml_tensor * ggml_diag_mask_zero_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past,
+        bool                  inplace) {
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    int32_t params[] = { n_past };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DIAG_MASK_ZERO;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_diag_mask_zero(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_zero_impl(ctx, a, n_past, false);
+}
+
+struct ggml_tensor * ggml_diag_mask_zero_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
 }
 
 // ggml_clamp
