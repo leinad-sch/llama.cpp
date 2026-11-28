@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-sm70-grouped.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -573,6 +574,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_SM70_GROUPED = 600,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -636,6 +638,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    const bool sm70_grouped_ok = ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc);
+    if (ggml_get_op_params_i32(dst, 5) != 0 && !sm70_grouped_ok) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (sm70_grouped_ok) {
+        return BEST_FATTN_KERNEL_SM70_GROUPED;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -846,6 +856,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_SM70_GROUPED:
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -869,6 +881,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70_GROUPED:
+            ggml_cuda_flash_attn_ext_sm70_grouped(ctx, dst);
             break;
     }
 }
