@@ -22,6 +22,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/fp8-sm70.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
@@ -2258,6 +2259,13 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_q4k_skinny_is_repacked(src0)) {
         ggml_cuda_mul_mat_q4k_skinny(ctx, src0, src1, dst);
         return false;
+    }
+
+    if constexpr (GGML_CUDA_FP8_SM70_COMPILED) {
+        if (src0->type == GGML_TYPE_F8_E4M3) {
+            ggml_cuda_mul_mat_fp8_sm70(ctx, src0, src1, dst);
+            return false;
+        }
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
