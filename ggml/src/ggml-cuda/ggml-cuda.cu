@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-push.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1388,6 +1389,10 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // V100 (sm70) push-based AllReduce.  Set up when P2P is available between
+    // all devices; tried before try_allreduce in the dispatch.
+    ggml_cuda_ar_push *         ar_push     = nullptr;
+
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
     int                         world_size = 0;
@@ -1411,6 +1416,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_push_free(ar_push);
     }
 };
 
@@ -1643,6 +1649,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
 
+    ret->ar_push = ggml_cuda_ar_push_init(ret->dev_ids.data(), ret->dev_ids.size());
+
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
@@ -1759,6 +1767,10 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->ar_push != nullptr &&
+        ggml_cuda_ar_push_allreduce(comm_ctx->ar_push, comm_ctx->backends.data(), tensors, false)) {
+        return true;
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
